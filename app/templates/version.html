@@ -8,7 +8,11 @@
   <p class="muted">图像 {{ version.image_count }} 张 ｜ 类别 {{ version.class_names }} ｜ 配额 {{ version.quotas }} ｜ 创建 {{ version.created_at }}</p>
   {% if manifest %}
     <p>发布清单 #{{ manifest.id }}：
-      {% if version.status=='active' %}
+      {% if manifest_block %}
+      <span class="muted">涉及患者
+        {% for b in manifest_block %}{{ b.patient_no }}（{% for s in b.sources %}#{{ s.manifest_id }}→{{ '验证' if s.side=='val' else '训练' }}{% if not loop.last %}、{% endif %}{% endfor %}）{% if not loop.last %}；{% endif %}{% endfor %}
+        已被同时发布到两侧，存在跨版本泄漏风险，下载停供（历史记录保留）</span>
+      {% elif version.status=='active' %}
       <a class="btn small" href="{{ url_for('download', manifest_id=manifest.id, side='val') }}">下载验证侧</a>
       <a class="btn small secondary" href="{{ url_for('download', manifest_id=manifest.id, side='train') }}">下载训练侧</a>
       {% else %}<span class="muted">历史版本，下载停供</span>{% endif %}

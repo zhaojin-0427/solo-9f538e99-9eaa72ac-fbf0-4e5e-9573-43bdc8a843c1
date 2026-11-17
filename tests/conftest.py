@@ -1,6 +1,5 @@
 import os
 import sys
-import tempfile
 
 import pytest
 
@@ -16,12 +15,9 @@ def tmp_db(tmp_path):
 
 
 @pytest.fixture()
-def svc(tmp_db):
-    return Service(tmp_db, synchronous=True)
-
-
-@pytest.fixture()
-def client(tmp_db):
+def client(tmp_db, monkeypatch):
+    # 测试内确定性：请求线程内同步完成作业（生产默认异步）
+    monkeypatch.setenv("PYX_SYNCHRONOUS", "1")
     app = create_app(tmp_db)
     app.config["TESTING"] = True
     with app.test_client() as c:

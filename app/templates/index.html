@@ -40,6 +40,30 @@
   </form>
 </div>
 
+{% if leaks %}
+<div class="card" id="leak-alert">
+  <h2 style="color:#b91c1c">⚠ 患者跨版本泄漏冲突：以下患者曾被发布到两侧</h2>
+  <p class="reason">同一患者的历史清单同时出现在训练侧与验证侧。涉及这些患者的当前清单已
+    <strong>停止下载</strong>；历史记录保留可查，但后续划分不得任选一侧，必须先更正输入
+    （如核对患者号归属、拆分/合并重复关系）后重新划分。</p>
+  <table>
+    <tr><th>患者号</th><th>涉及图像</th><th>来源清单与侧别</th></tr>
+    {% for l in leaks %}
+    <tr>
+      <td><strong>{{ l.patient_no }}</strong></td>
+      <td>{{ l.images|join('、') }}</td>
+      <td>
+        {% for s in l.sources %}
+          <span class="tag {{ s.side }}">清单 #{{ s.manifest_id }}（v{{ s.version_id }}）→
+            {{ '验证' if s.side=='val' else '训练' }}</span>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
 {% if version %}
 <div class="card">
   <h2>② 当前输入版本 v{{ version.id }} <span class="tag ok">{{ version.status }}</span>
@@ -60,9 +84,17 @@
 <div class="card">
   <h2>④ 当前已发布清单 #{{ manifest.id }}
     <span class="tag ok">published</span>
+    {% if not manifest_block %}
     <a class="btn small" style="margin-left:10px" href="{{ url_for('download', manifest_id=manifest.id, side='val') }}">下载验证侧 CSV</a>
     <a class="btn small secondary" href="{{ url_for('download', manifest_id=manifest.id, side='train') }}">下载训练侧 CSV</a>
+    {% endif %}
   </h2>
+  {% if manifest_block %}
+  <p class="reason">该当前清单涉及患者
+    {% for b in manifest_block %}{{ b.patient_no }}（{% for s in b.sources %}清单 #{{ s.manifest_id }}→{{ '验证' if s.side=='val' else '训练' }}{% if not loop.last %}、{% endif %}{% endfor %}）{% if not loop.last %}；{% endif %}{% endfor %}
+    的历史侧别已被同时发布到两侧，存在跨版本泄漏风险，<strong>当前清单下载停供</strong>。
+    历史记录保留；后续划分将由求解器判关联冲突，不得任选一侧。</p>
+  {% endif %}
   <table>
     <tr><th>图像号</th><th>患者号</th><th>类别</th><th>连通分量</th><th>侧别</th></tr>
     {% for e in entries %}

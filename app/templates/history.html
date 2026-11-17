@@ -1,6 +1,27 @@
 {% extends "base.html" %}
 {% block title %}历史版本与作业{% endblock %}
 {% block body %}
+{% if leaks %}
+<div class="card" id="leak-alert">
+  <h2 style="color:#b91c1c">⚠ 患者跨版本泄漏冲突（历史保留，涉及清单停供）</h2>
+  <table>
+    <tr><th>患者号</th><th>涉及图像</th><th>来源清单与侧别</th></tr>
+    {% for l in leaks %}
+    <tr>
+      <td><strong>{{ l.patient_no }}</strong></td>
+      <td>{{ l.images|join('、') }}</td>
+      <td>
+        {% for s in l.sources %}
+          <span class="tag {{ s.side }}">清单 #{{ s.manifest_id }}（v{{ s.version_id }}）→
+            {{ '验证' if s.side=='val' else '训练' }}</span>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
 <div class="card">
   <h2>输入版本历史（更正后旧版本及其清单仅作历史，下载停供）</h2>
   <table>
@@ -48,12 +69,18 @@
     <tr>
       <td>#{{ m.id }}</td>
       <td>v{{ m.version_id }}</td>
-      <td>{% if m.version_status=='active' %}<span class="tag ok">当前</span>{% else %}<span class="tag hist">历史-停供</span>{% endif %}</td>
+      <td>{% if manifest_block.get(m.id) %}<span class="tag fail">泄漏-停供</span>
+          {% elif m.version_status=='active' %}<span class="tag ok">当前</span>
+          {% else %}<span class="tag hist">历史-停供</span>{% endif %}</td>
       <td>{{ m.created_at }}</td>
       <td>
-        {% if m.version_status=='active' %}
+        {% if m.version_status=='active' and not manifest_block.get(m.id) %}
         <a class="btn small" href="{{ url_for('download', manifest_id=m.id, side='val') }}">验证侧</a>
         <a class="btn small secondary" href="{{ url_for('download', manifest_id=m.id, side='train') }}">训练侧</a>
+        {% elif manifest_block.get(m.id) %}
+        <span class="muted">患者
+          {% for b in manifest_block.get(m.id) %}{{ b.patient_no }}（{% for s in b.sources %}#{{ s.manifest_id }}→{{ '验证' if s.side=='val' else '训练' }}{% if not loop.last %}、{% endif %}{% endfor %}）{% if not loop.last %}；{% endif %}{% endfor %}
+          跨侧泄漏，停供</span>
         {% else %}<span class="muted">已停供，仅可在版本详情中查看</span>{% endif %}
       </td>
     </tr>

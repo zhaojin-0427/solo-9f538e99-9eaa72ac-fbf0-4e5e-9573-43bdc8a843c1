@@ -16,7 +16,7 @@ from .parser import (
     parse_quota,
     validate_and_build,
 )
-from .solver import SolveError, solve
+from .solver import PatientHistory, SolveError, solve
 
 
 class Service:
@@ -256,13 +256,14 @@ class Service:
                 r["image_no"]: r["side"]
                 for r in conn.execute("SELECT image_no, side FROM side_registry").fetchall()
             }
+            history = self._load_patient_history(conn)
         finally:
             conn.close()
         if self.solve_delay:
             import time
 
             time.sleep(self.solve_delay)
-        result = solve(components, classes, quota, registry)
+        result = solve(components, classes, quota, registry, history)
         img_index = {r.image_no: r for r in images}
         entries = []
         for comp in components:
@@ -287,10 +288,92 @@ class Service:
                     "component_id": lc.component.cid,
                     "side": lc.side,
                     "locked_images": lc.locked_images,
+                    "locked_patients": lc.locked_patients,
                 }
                 for lc in result.locked
             ],
         }
+
+    @staticmethod
+    def _load_patient_history(conn: sqlite3.Connection) -> PatientHistory:
+        """以**全部已发布明细**（含已转历史的清单）为患者侧别依据。
+
+        记录每个患者出现过的侧别及来源清单；同一患者出现在两侧即视为历史污染。
+        """
+        history = PatientHistory()
+        rows = conn.execute(
+            "SELECT e.patient_no, e.side, e.manifest_id, m.version_id "
+            "FROM manifest_entries e JOIN manifests m ON m.id=e.manifest_id "
+            "WHERE m.status='published' ORDER BY e.manifest_id"
+        ).fetchall()
+        for r in rows:
+            history.manifest_versions[r["manifest_id"]] = r["version_id"]
+            sides = history.sides.setdefault(r["patient_no"], {})
+            ids = sides.setdefault(r["side"], [])
+            if r["manifest_id"] not in ids:
+                ids.append(r["manifest_id"])
+        return history
+
+    def patient_leaks(self) -> list[dict]:
+        """找出历史上被同时发布到两侧的患者。
+
+        返回 [{"patient_no", "images": [...], "sources": [{manifest_id, version_id, side}]}]，
+        供页面指出患者与来源清单。历史记录本身保留（不删除、不改写）。
+        """
+        conn = get_db(self.db_path)
+        try:
+            history = self._load_patient_history(conn)
+            images: dict[str, set[str]] = {}
+            for r in conn.execute(
+                "SELECT DISTINCT e.patient_no, e.image_no FROM manifest_entries e "
+                "JOIN manifests m ON m.id=e.manifest_id WHERE m.status='published'"
+            ).fetchall():
+                images.setdefault(r["patient_no"], set()).add(r["image_no"])
+        finally:
+            conn.close()
+        out = []
+        for patient in sorted(history.sides):
+            if not history.is_conflicted(patient):
+                continue
+            out.append(
+                {
+                    "patient_no": patient,
+                    "sides": sorted(history.sides_of(patient)),
+                    "images": sorted(images.get(patient, set())),
+                    "sources": history.sources(patient),
+                }
+            )
+        return out
+
+    def manifest_conflicts(self) -> dict[int, list[dict]]:
+        """清单 id -> 该清单涉及、且历史已被发布到两侧的患者及其来源清单。
+
+        这些清单必须停止下载：旧卷把同一患者发布到两侧后，涉及该患者的任何清单
+        都不能再作为训练/验证依据。历史记录保留可查，后续划分由求解器判冲突。
+        """
+        conn = get_db(self.db_path)
+        try:
+            history = self._load_patient_history(conn)
+            rows = conn.execute(
+                "SELECT DISTINCT e.manifest_id, e.patient_no FROM manifest_entries e "
+                "JOIN manifests m ON m.id=e.manifest_id "
+                "WHERE m.status='published' ORDER BY e.manifest_id, e.patient_no"
+            ).fetchall()
+        finally:
+            conn.close()
+        blocked: dict[int, list[dict]] = {}
+        for r in rows:
+            patient = r["patient_no"]
+            if not history.is_conflicted(patient):
+                continue
+            blocked.setdefault(r["manifest_id"], []).append(
+                {
+                    "patient_no": patient,
+                    "sides": sorted(history.sides_of(patient)),
+                    "sources": history.sources(patient),
+                }
+            )
+        return blocked
 
     def _publish(self, job_id: int, version_id: int, data: dict) -> None:
         """原子发布：版本新鲜度复查 → 清单 → 侧别登记 → 作业成功，同一事务。"""
@@ -321,19 +404,83 @@ class Service:
                 conn.execute("COMMIT")
                 return
 
+            # 按最新已提交依据裁决：事务内重新读取永久登记与全部已发布明细，
+            # 求解后才提交的更正/发布必须在这里被察觉，否则整体失败、不写半份清单。
+            registry = {
+                r["image_no"]: r["side"]
+                for r in conn.execute("SELECT image_no, side FROM side_registry").fetchall()
+            }
+            history = self._load_patient_history(conn)
+            leaked = [
+                {"patient_no": patient, "sources": history.sources(patient)}
+                for patient in sorted({e["patient_no"] for e in data["entries"]})
+                if history.is_conflicted(patient)
+            ]
+            if leaked:
+                detail = {
+                    "conflict_type": "patient_both_sides",
+                    "patients": leaked,
+                }
+                conn.execute(
+                    "UPDATE partition_jobs SET status='failed', fail_stage='conflict', "
+                    "reason=?, detail=?, finished_at=datetime('now') WHERE id=?",
+                    (
+                        "关联冲突：患者 "
+                        + "、".join(x["patient_no"] for x in leaked)
+                        + " 的历史清单已把同一患者发布到训练侧与验证侧，"
+                        "当前清单不得任选一侧发布，已中止发布，未写入任何分配。",
+                        json.dumps(detail, ensure_ascii=False),
+                        job_id,
+                    ),
+                )
+                conn.execute("COMMIT")
+                return
+
+            # 患者历史侧别（求解后才提交的新依据也要服从）
+            patient_conflicts = []
+            for e in data["entries"]:
+                expected = history.side_of(e["patient_no"])
+                if expected is not None and expected != e["side"]:
+                    patient_conflicts.append(
+                        {
+                            "image_no": e["image_no"],
+                            "patient_no": e["patient_no"],
+                            "expected_side": expected,
+                            "assigned_side": e["side"],
+                            "sources": history.sources(e["patient_no"]),
+                        }
+                    )
+            if patient_conflicts:
+                first = patient_conflicts[0]
+                conn.execute(
+                    "UPDATE partition_jobs SET status='failed', fail_stage='conflict', "
+                    "reason=?, detail=?, finished_at=datetime('now') WHERE id=?",
+                    (
+                        "关联冲突：求解完成后，患者侧别依据已更新。"
+                        f"患者 {first['patient_no']} 的历史侧别为 {first['expected_side']}，"
+                        f"本次分配却为 {first['assigned_side']}；"
+                        "已中止发布，未写入任何分配。请按最新依据重新发起划分。",
+                        json.dumps(
+                            {"conflict_type": "patient_history_changed",
+                             "conflicts": patient_conflicts},
+                            ensure_ascii=False,
+                        ),
+                        job_id,
+                    ),
+                )
+                conn.execute("COMMIT")
+                return
+
             # 登记侧别前再次核对：永久登记与本次分配必须一致，冲突则整体失败
             for e in data["entries"]:
-                row = conn.execute(
-                    "SELECT side FROM side_registry WHERE image_no=?",
-                    (e["image_no"],),
-                ).fetchone()
-                if row is not None and row["side"] != e["side"]:
+                registered = registry.get(e["image_no"])
+                if registered is not None and registered != e["side"]:
                     conn.execute(
                         "UPDATE partition_jobs SET status='failed', fail_stage='conflict', "
                         "finished_at=datetime('now'), reason=? WHERE id=?",
                         (
                             f"关联冲突：图像 {e['image_no']} 曾发布且侧别永久固定为 "
-                            f"{row['side']}，本次求解结果为 {e['side']}，已中止发布，未写入任何分配。",
+                            f"{registered}，本次求解结果为 {e['side']}，已中止发布，未写入任何分配。",
                             job_id,
                         ),
                     )

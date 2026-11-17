@@ -37,6 +37,10 @@ def create_app(db_path: str | None = None) -> Flask:
         version = svc.current_version()
         manifest = svc.current_manifest()
         entries = svc.get_manifest_entries(manifest["id"]) if manifest else []
+        leaks = svc.patient_leaks()
+        manifest_block = {}
+        if manifest:
+            manifest_block = svc.manifest_conflicts().get(manifest["id"], [])
         jobs = svc.list_jobs(limit=8)
         classes = version["class_names"].split(",") if version else []
         quotas = json.loads(version["quotas"]) if version else {}
@@ -55,6 +59,8 @@ def create_app(db_path: str | None = None) -> Flask:
             quotas=quotas,
             val_counts=val_counts,
             train_counts=train_counts,
+            leaks=leaks,
+            manifest_block=manifest_block,
         )
 
     # ------------------------------------------------------------ 上传/更正
@@ -106,6 +112,7 @@ def create_app(db_path: str | None = None) -> Flask:
         version = svc.get_version(job["version_id"])
         manifest = None
         entries = []
+        manifest_block = []
         if job["manifest_id"]:
             conn = get_db(svc.db_path)
             try:
@@ -115,8 +122,14 @@ def create_app(db_path: str | None = None) -> Flask:
             finally:
                 conn.close()
             entries = svc.get_manifest_entries(job["manifest_id"])
+            manifest_block = svc.manifest_conflicts().get(job["manifest_id"], [])
         return render_template(
-            "job.html", job=job, version=version, manifest=manifest, entries=entries
+            "job.html",
+            job=job,
+            version=version,
+            manifest=manifest,
+            entries=entries,
+            manifest_block=manifest_block,
         )
 
     @app.route("/jobs/<int:job_id>/status")
@@ -140,7 +153,12 @@ def create_app(db_path: str | None = None) -> Flask:
         jobs = svc.list_jobs(limit=100)
         manifests = svc.list_manifests()
         return render_template(
-            "history.html", versions=versions, jobs=jobs, manifests=manifests
+            "history.html",
+            versions=versions,
+            jobs=jobs,
+            manifests=manifests,
+            leaks=svc.patient_leaks(),
+            manifest_block=svc.manifest_conflicts(),
         )
 
     @app.route("/versions/<int:version_id>")
@@ -170,6 +188,9 @@ def create_app(db_path: str | None = None) -> Flask:
             edges=edges,
             manifest=manifest,
             quotas=json.loads(version["quotas"]),
+            manifest_block=(
+                svc.manifest_conflicts().get(manifest["id"], []) if manifest else []
+            ),
         )
 
     # ------------------------------------------------------------ 侧别登记
@@ -197,6 +218,21 @@ def create_app(db_path: str | None = None) -> Flask:
         # 更正后旧清单仅作历史：非当前版本一律停供下载
         if manifest["version_status"] != "active":
             flash("该清单所属输入版本已被更正，仅作历史保留，当前下载停供。", "error")
+            return redirect(url_for("history"))
+        # 患者侧别保护：旧卷把同一患者发布到两侧时，涉及该患者的清单停供下载
+        blocked = svc.manifest_conflicts().get(manifest_id)
+        if blocked:
+            patients = "、".join(
+                f"{b['patient_no']}（来源清单 "
+                + "、".join(f"#{s['manifest_id']}→v{s['version_id']}" for s in b["sources"])
+                + "）"
+                for b in blocked
+            )
+            flash(
+                f"该清单涉及的 {patients} 在历史清单中已被同时发布到训练侧与验证侧，"
+                "存在跨版本泄漏风险，当前下载停供；历史记录保留，请更正输入后重新划分。",
+                "error",
+            )
             return redirect(url_for("history"))
         entries = [e for e in svc.get_manifest_entries(manifest_id) if e["side"] == side]
         buf = io.StringIO()

@@ -24,8 +24,16 @@
   {% if manifest and entries %}
   <h2 style="margin-top:18px">清单 #{{ manifest.id }} 分配明细</h2>
   <p>
+    {% if manifest_block %}
+    <span class="muted">涉及患者
+      {% for b in manifest_block %}{{ b.patient_no }}（{% for s in b.sources %}#{{ s.manifest_id }}→{{ '验证' if s.side=='val' else '训练' }}{% if not loop.last %}、{% endif %}{% endfor %}）{% if not loop.last %}；{% endif %}{% endfor %}
+      已被同时发布到两侧，存在跨版本泄漏风险，下载停供（历史记录保留）</span>
+    {% elif version and version.status != 'active' %}
+    <span class="muted">版本已被更正，清单仅作历史保留，下载停供</span>
+    {% else %}
     <a class="btn small" href="{{ url_for('download', manifest_id=manifest.id, side='val') }}">下载验证侧 CSV</a>
     <a class="btn small secondary" href="{{ url_for('download', manifest_id=manifest.id, side='train') }}">下载训练侧 CSV</a>
+    {% endif %}
   </p>
   <table>
     <tr><th>图像号</th><th>患者号</th><th>类别</th><th>连通分量</th><th>侧别</th></tr>
